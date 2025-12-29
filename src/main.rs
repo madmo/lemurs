@@ -7,6 +7,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use log::{error, info, warn};
+use nix::errno::Errno;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -278,6 +279,7 @@ struct Hooks<'a> {
 pub enum StartSessionError {
     AuthenticationError(AuthenticationError),
     EnvironmentStartError(EnvironmentStartError),
+    ForkFailed(Errno),
 }
 
 impl From<EnvironmentStartError> for StartSessionError {
@@ -308,63 +310,61 @@ fn start_session(
         pre_validate_hook();
     }
 
-    let mut process_env = EnvironmentContainer::take_snapshot();
-
     if let Some(pre_auth_hook) = hooks.pre_auth {
         pre_auth_hook();
     }
 
-    if matches!(post_login_env, PostLoginEnvironment::X { .. }) {
-        set_display(&config.x11.x11_display, &mut process_env);
-    }
-    set_session_params(&mut process_env, post_login_env);
-    remove_xdg(&mut process_env);
+    try_auth(username, password, &config.pam_service, |auth_session| {
+        let mut process_env = EnvironmentContainer::take_snapshot();
+        if matches!(post_login_env, PostLoginEnvironment::X { .. }) {
+            set_display(&config.x11.x11_display, &mut process_env);
+        }
+        set_session_params(&mut process_env, post_login_env);
+        remove_xdg(&mut process_env);
+        if let Some(pre_environment_hook) = hooks.pre_environment {
+            pre_environment_hook();
+        }
 
-    let auth_session = try_auth(username, password, &config.pam_service)?;
+        let tty = config.tty;
+        let uid = auth_session.uid;
+        let homedir = &auth_session.home_dir;
+        let shell = &auth_session.shell;
 
-    if let Some(pre_environment_hook) = hooks.pre_environment {
-        pre_environment_hook();
-    }
+        set_seat_vars(&mut process_env, tty);
+        set_session_vars(&mut process_env, uid);
+        set_basic_variables(
+            &mut process_env,
+            username,
+            homedir,
+            shell,
+            &config.initial_path,
+        );
+        set_xdg_common_paths(&mut process_env, homedir);
 
-    let tty = config.tty;
-    let uid = auth_session.uid;
-    let homedir = &auth_session.home_dir;
-    let shell = &auth_session.shell;
+        let spawned_environment = post_login_env.spawn(&auth_session, &mut process_env, config)?;
 
-    set_seat_vars(&mut process_env, tty);
-    set_session_vars(&mut process_env, uid);
-    set_basic_variables(
-        &mut process_env,
-        username,
-        homedir,
-        shell,
-        &config.initial_path,
-    );
-    set_xdg_common_paths(&mut process_env, homedir);
+        let pid = spawned_environment.pid();
 
-    let spawned_environment = post_login_env.spawn(&auth_session, &mut process_env, config)?;
+        let utmpx_session = add_utmpx_entry(username, tty, pid);
+        drop(process_env);
 
-    let pid = spawned_environment.pid();
+        info!("Waiting for environment to terminate");
 
-    let utmpx_session = add_utmpx_entry(username, tty, pid);
-    drop(process_env);
+        if let Some(pre_wait_hook) = hooks.pre_wait {
+            pre_wait_hook();
+        }
 
-    info!("Waiting for environment to terminate");
+        spawned_environment.wait();
 
-    if let Some(pre_wait_hook) = hooks.pre_wait {
-        pre_wait_hook();
-    }
+        info!("Environment terminated. Returning to Lemurs...");
 
-    spawned_environment.wait();
+        if let Some(pre_return_hook) = hooks.pre_return {
+            pre_return_hook();
+        }
 
-    info!("Environment terminated. Returning to Lemurs...");
+        drop(utmpx_session);
+        drop(auth_session);
 
-    if let Some(pre_return_hook) = hooks.pre_return {
-        pre_return_hook();
-    }
-
-    drop(utmpx_session);
-    drop(auth_session);
-
-    Ok(())
+        Ok(())
+    })
 }

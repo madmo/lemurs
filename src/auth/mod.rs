@@ -2,10 +2,11 @@ mod pam;
 pub mod utmpx;
 
 use ::pam::{Authenticator, PasswordConv};
-use log::info;
+use log::{error, info};
+use nix::{sys::wait::waitpid, unistd::fork};
 
-use crate::auth::pam::open_session;
 pub use crate::auth::pam::AuthenticationError;
+use crate::{auth::pam::open_session, StartSessionError};
 
 pub struct AuthUserInfo<'a> {
     // This is used to keep the user session. If the struct is dropped then the user session is
@@ -23,18 +24,40 @@ pub struct AuthUserInfo<'a> {
     pub shell: String,
 }
 
-pub fn try_auth<'a>(
+pub fn try_auth<'a, F>(
     username: &str,
     password: &str,
     pam_service: &str,
-) -> Result<AuthUserInfo<'a>, AuthenticationError> {
+    mut session_func: F,
+) -> Result<(), StartSessionError>
+where
+    F: FnMut(AuthUserInfo<'a>) -> Result<(), StartSessionError>,
+{
     info!("Login attempt for '{username}'");
 
-    open_session(username, password, pam_service).inspect_err(|err| {
-        info!(
-            "Authentication failed for '{}'. Reason: {}",
-            username,
-            err.to_string()
-        );
-    })
+    let fork_result = unsafe { fork() };
+
+    match fork_result {
+        Ok(nix::unistd::ForkResult::Parent { child }) => {
+            let _ = waitpid(child, None).unwrap();
+            Ok(())
+        }
+        Ok(nix::unistd::ForkResult::Child) => {
+            let session = open_session(username, password, pam_service).inspect_err(|err| {
+                info!(
+                    "Authentication failed for '{}'. Reason: {}",
+                    username,
+                    err.to_string()
+                );
+            })?;
+
+            session_func(session)?;
+
+            Ok(())
+        }
+        Err(e) => {
+            error!("fork failed: {e}");
+            Err(StartSessionError::ForkFailed(e))
+        }
+    }
 }

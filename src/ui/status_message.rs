@@ -1,3 +1,4 @@
+use nix::errno::Errno;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -13,6 +14,7 @@ pub enum ErrorStatusMessage {
     FailedGraphicalEnvironment,
     FailedDesktop,
     FailedPowerControl(String),
+    ForkFailed(Errno),
 }
 
 impl From<ErrorStatusMessage> for Box<str> {
@@ -27,6 +29,7 @@ impl From<ErrorStatusMessage> for Box<str> {
             FailedPowerControl(name) => {
                 format!("Failed to {name}... Check the logs for more information").into()
             }
+            ForkFailed(errno) => format!("Fork failed: {errno}").into(),
         }
     }
 }

@@ -461,6 +461,10 @@ impl LoginForm {
                                     &config,
                                 ) {
                                     Ok(()) => {}
+                                    Err(StartSessionError::ForkFailed(errno)) => {
+                                        status_message.set(ErrorStatusMessage::ForkFailed(errno));
+                                        send_ui_request(UIThreadRequest::Redraw);
+                                    }
                                     Err(StartSessionError::AuthenticationError(err)) => {
                                         status_message
                                             .set(ErrorStatusMessage::AuthenticationError(err));
